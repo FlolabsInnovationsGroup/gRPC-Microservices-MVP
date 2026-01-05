@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package echo;
+option java_package = "com.example.demo.proto";
+option java_multiple_files = true;
+
+service PythonService {
+  rpc PythonEcho (EchoRequest) returns (EchoResponse);
+}
+
+service JavaService {
+  rpc JavaEcho (EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}
