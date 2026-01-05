@@ -82,28 +82,9 @@ Python Service
    docker-compose up --build
    ```
 
-2. **Test HTTP endpoint:**
+2. **Test:**
    ```bash
-   curl http://localhost:8081/ping
-   ```
-   Expected response: `Python says: hello from http`
-
-3. **Verify Python service is not externally accessible:**
-   ```bash
-   curl http://localhost:50051
-   ```
-   Expected: Connection refused (confirms Python is internal-only)
-
-4. **View logs:**
-   ```bash
-   # All services
-   docker-compose logs -f
-   
-   # Python service only
-   docker-compose logs -f python-service
-   
-   # Java service only
-   docker-compose logs -f java-service
+   ./test.sh
    ```
 
 ### Expected Behavior
@@ -135,7 +116,7 @@ To also remove volumes and images:
 docker-compose down -v --rmi all
 ```
 
-## Deployment to AWS ECS
+## Deployment to AWS ECS using CloudFormation
 
 The same Docker images work in both local and ECS environments. Only configuration changes are needed.
 
@@ -143,106 +124,116 @@ The same Docker images work in both local and ECS environments. Only configurati
 
 **None!** The code uses environment variables for service discovery, making it environment-agnostic.
 
-### ECS Configuration Required
+### CloudFormation Configuration Points
 
-#### 1. Environment Variables
+Assuming you have existing stacks (`stack-01-storage-iam.yaml` and `stack-02-networking.yaml`), configure the following in your ECS stack:
 
-Set these environment variables in your ECS task definitions to use Cloud Map DNS names:
+**Already Available (from existing stacks):**
+- ✓ VPC with DNS enabled
+- ✓ Public and Private Subnets
+- ✓ ALB Security Group (port 443)
+- ✓ ECS Security Group (basic, may need modification)
+- ✓ IAM Task Role (`AppIamRole` from storage-iam stack)
+
+**Need to Create/Modify:**
+- Cloud Map namespace and services
+- IAM Role(s) - For testing, one role is sufficient; for production, separate execution and task roles
+- Separate security groups for Java and Python services (or modify existing)
+- ECS Cluster, Task Definitions, and Services
+- Application Load Balancer and Target Groups
+
+#### 1. Import Existing Resources
+
+Reference existing resources from previous stacks using `Fn::ImportValue`:
+
+- **VPC**: Import `flolabs-${Env}-VpcId` from networking stack
+- **Subnets**: Import `flolabs-${Env}-PrivateSubnetId` (use private subnet for ECS tasks)
+- **ALB Security Group**: Import `flolabs-${Env}-AlbSecurityGroupId` (note: existing stack allows port 443, you may need to add port 80)
+- **IAM Task Role**: Import `AppIamRoleArn` from storage-iam stack (for application permissions)
+
+#### 2. Additional Security Groups
+
+The existing `EcsSecurityGroup` in `stack-02-networking.yaml` only allows port 50051 from ALB. You need to create separate security groups or modify rules:
+
+**Java Service Security Group** (new or modify existing):
+- Inbound: Port 8080 from ALB security group (imported)
+- Inbound: Port 50052 from Python service security group
+- Outbound: Allow all
+
+**Python Service Security Group** (new):
+- Inbound: Port 50051 from Java service security group
+- Outbound: Port 50052 to Java service security group
+
+**Note**: Consider updating `stack-02-networking.yaml` to add port 80 to `AlbSecurityGroup` if you want HTTP access.
+
+#### 3. IAM Roles
+
+**For Testing/MVP (Simplified):**
+You can use a single IAM role for both execution and task purposes:
+- Create one `AWS::IAM::Role` with:
+  - Trust policy: `ecs-tasks.amazonaws.com`
+  - Attach managed policy: `AmazonECSTaskExecutionRolePolicy` (for pulling images, CloudWatch logs)
+  - Add any additional permissions needed by your application
+- Use this same role for both `ExecutionRoleArn` and `TaskRoleArn` in task definitions
+
+**For Production (Recommended):**
+- **Execution Role**: For ECS to pull images, write logs (attach `AmazonECSTaskExecutionRolePolicy`)
+- **Task Role**: For application permissions (you can reuse `AppIamRole` from `stack-01-storage-iam.yaml` via ImportValue)
+
+#### 4. Cloud Map Service Discovery
+
+Create `AWS::ServiceDiscovery::PrivateDnsNamespace` and `AWS::ServiceDiscovery::Service` resources:
+
+- **Namespace**: `flolabs.local` (use the VPC imported from networking stack)
+- **Java Service Discovery**: 
+  - Service name: `java-service`
+  - DNS record: `java-service.flolabs.local`
+- **Python Service Discovery**:
+  - Service name: `python-service`
+  - DNS record: `python-service.flolabs.local`
+
+Link services to ECS services using `ServiceRegistries` in `AWS::ECS::Service`.
+
+#### 5. Environment Variables in Task Definitions
+
+In your `AWS::ECS::TaskDefinition` resources, set environment variables to use Cloud Map DNS names:
 
 **Java Service Task Definition:**
-```json
-{
-  "environment": [
-    {
-      "name": "PYTHON_SERVICE_HOST",
-      "value": "python-service.flolabs.local"
-    },
-    {
-      "name": "JAVA_SERVICE_HOST",
-      "value": "java-service.flolabs.local"
-    }
-  ]
-}
-```
+- `PYTHON_SERVICE_HOST`: `python-service.flolabs.local`
+- `JAVA_SERVICE_HOST`: `java-service.flolabs.local`
 
 **Python Service Task Definition:**
-```json
-{
-  "environment": [
-    {
-      "name": "JAVA_SERVICE_HOST",
-      "value": "java-service.flolabs.local"
-    },
-    {
-      "name": "PYTHON_SERVICE_HOST",
-      "value": "python-service.flolabs.local"
-    }
-  ]
-}
-```
+- `JAVA_SERVICE_HOST`: `java-service.flolabs.local`
+- `PYTHON_SERVICE_HOST`: `python-service.flolabs.local`
 
-#### 2. AWS Cloud Map Service Discovery
+#### 6. Network Configuration
 
-Create Cloud Map services for service discovery:
+In `AWS::ECS::TaskDefinition`:
+- Set `NetworkMode: awsvpc`
+- In `AWS::ECS::Service`, use imported private subnet(s) from networking stack
+- VPC DNS is already enabled in `stack-02-networking.yaml` ✓
+
+#### 7. Container Port Mappings
+
+In task definition `ContainerDefinitions`:
 
 **Java Service:**
-- Namespace: `flolabs.local` (or your preferred namespace)
-- Service name: `java-service`
-- DNS record: `java-service.flolabs.local`
+- Container port 8080 (HTTP)
+- Container port 50052 (gRPC)
 
 **Python Service:**
-- Namespace: `flolabs.local`
-- Service name: `python-service`
-- DNS record: `python-service.flolabs.local`
+- Container port 50051 (gRPC)
 
-#### 3. Security Groups
+#### 8. Application Load Balancer
 
-**Java Service Security Group:**
-- **Inbound Rules:**
-  - Port 8080 (HTTP): Allow from ALB security group
-  - Port 50052 (gRPC): Allow from Python service security group
-- **Outbound Rules:** Allow all
+Create `AWS::ElasticLoadBalancingV2::LoadBalancer`:
+- Use imported public subnet(s) from networking stack
+- Use imported `AlbSecurityGroup` (or update it to allow port 80)
+- Create `AWS::ElasticLoadBalancingV2::TargetGroup` pointing to Java service port 8080
+- Set health check path to `/ping`
+- Link to Java service in `AWS::ECS::Service` using `LoadBalancers`
 
-**Python Service Security Group:**
-- **Inbound Rules:**
-  - Port 50051 (gRPC): Allow from Java service security group
-- **Outbound Rules:**
-  - Port 50052 (gRPC): Allow to Java service security group
-
-#### 4. Network Configuration
-
-- Use `awsvpc` network mode (each task gets its own ENI)
-- All services should be in the same VPC and subnets
-- Ensure VPC DNS resolution and DNS hostnames are enabled
-
-#### 5. Container Port Mappings
-
-**Java Service:**
-- Container port 8080 → Host port 8080 (HTTP)
-- Container port 50052 → Host port 50052 (gRPC)
-
-**Python Service:**
-- Container port 50051 → Host port 50051 (gRPC)
-
-#### 6. Application Load Balancer (Optional)
-
-If exposing HTTP endpoint externally:
-- Listener: Port 80/443
-- Target Group: Java service (port 8080)
-- Health Check: `/ping` endpoint
-
-### ECS Deployment Checklist
-
-- [ ] Create Cloud Map namespace and register services
-- [ ] Configure environment variables in task definitions (Cloud Map DNS names)
-- [ ] Set up security groups for inter-service communication
-- [ ] Configure network mode: `awsvpc`
-- [ ] Set container port mappings
-- [ ] (Optional) Configure ALB for external HTTP access
-- [ ] (Optional) Set up CloudWatch Logs for log aggregation
-- [ ] (Optional) Configure IAM roles for service permissions
-
-### Verification on ECS
+### Verification
 
 1. **Check service discovery:**
    ```bash
