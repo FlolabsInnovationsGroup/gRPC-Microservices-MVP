@@ -12,13 +12,17 @@ import org.springframework.stereotype.Service;
 @Service
 public class GrpcClient {
 
+  // BlockingStub means the call waits for a response (Synchronous)
   private final PythonServiceGrpc.PythonServiceBlockingStub stub;
   private final ManagedChannel channel;
 
-  public GrpcClient(@Value("${python.service.host}") String host,
+  public GrpcClient(
+      @Value("${python.service.host}") String host,
       @Value("${python.service.port}") int port) {
+    // Creates a connection channel to the Python service
+    // ManagedChannelBuilder.forAddress uses the HOSTNAME (dns) to find the service
     this.channel = ManagedChannelBuilder.forAddress(host, port)
-        .usePlaintext()
+        .usePlaintext() // No SSL for internal private network
         .build();
     this.stub = PythonServiceGrpc.newBlockingStub(channel);
   }
